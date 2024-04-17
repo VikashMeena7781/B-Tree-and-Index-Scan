@@ -4,13 +4,15 @@ import storage.DB;
 import storage.File;
 import storage.Block;
 import Utils.CsvRowConverter;
-
+import index.bplusTree.BPlusTreeIndexFile;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.List;
-import java.util.ArrayList;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.*;
+
+import javafx.util.Pair;
 
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexLiteral;
@@ -20,8 +22,6 @@ import org.json.simple.JSONArray;
 import org.json.simple.JSONObject;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
-
-import java.util.Iterator;
 
 public class StorageManager {
 
@@ -153,7 +153,7 @@ public class StorageManager {
                     }
                     variable_length.add(strBytes.length);
                 }
-            } else if (typeList.get(i).getSqlTypeName().getName().equals("BOOLEAN")) {         
+            } else if (typeList.get(i).getSqlTypeName().getName().equals("BOOLEAN")) {
                 if(row[i] == null){
                     fixed_length_nullBitmap.add(true);
                     fixed_length_Bytes.add((byte) 0);
@@ -163,7 +163,7 @@ public class StorageManager {
                     fixed_length_Bytes.add((byte) (val ? 1 : 0));
                 }
             } else if (typeList.get(i).getSqlTypeName().getName().equals("FLOAT")) {
-                
+
                 if(row[i] == null){
                     fixed_length_nullBitmap.add(true);
                     for(int j = 0; j < 4; j++) {
@@ -183,7 +183,7 @@ public class StorageManager {
                     }
                 }
             } else if (typeList.get(i).getSqlTypeName().getName().equals("DOUBLE")) {
-                
+
                 if(row[i] == null){
                     fixed_length_nullBitmap.add(true);
                     for(int j = 0; j < 8; j++) {
@@ -309,14 +309,14 @@ public class StorageManager {
         for(int i = 0 ; i < columnNames.size() ; i ++){
             // if column type is fixed, then write it
             if(!typeList.get(i).getSqlTypeName().getName().equals("VARCHAR")) {
-                
+
                 // write offset
                 curr_offset = curr_offset - (columnNames.get(i).length() + 2);
                 byte[] offset = new byte[2];
                 offset[0] = (byte) (curr_offset & 0xFF);
                 offset[1] = (byte) ((curr_offset >> 8) & 0xFF);
                 schema.write_data(2 + 2 * idx, offset);
-                
+
                 // convert column name to bytes
                 byte[] column_name_type = new byte[columnNames.get(i).length() + 2];
                 // first byte will tell datatype, 2nd byte will tell length of column name
@@ -337,15 +337,15 @@ public class StorageManager {
         // write variable length fields
         for(int i = 0; i < columnNames.size(); i++) {
             if(typeList.get(i).getSqlTypeName().getName().equals("VARCHAR")) {
-                
+
                 // write offset
                 curr_offset = curr_offset - (columnNames.get(i).length() + 2);
                 byte[] offset = new byte[2];
                 offset[0] = (byte) (curr_offset & 0xFF);
-                offset[1] = (byte) ((curr_offset >> 8) & 0xFF); 
+                offset[1] = (byte) ((curr_offset >> 8) & 0xFF);
                 // IMPORTANT: Take care of endianness
                 schema.write_data(2 + 2 * idx, offset);
-                
+
                 // convert column name to bytes
                 byte[] column_name_type = new byte[columnNames.get(i).length() + 2];
                 // first byte will tell datatype, 2nd byte will tell length of column name
@@ -372,6 +372,8 @@ public class StorageManager {
         return db.get_data(file_id, block_id);
     }
 
+
+
     public boolean check_file_exists(String table_name) {
         return file_to_fileid.get(table_name) != null;
     }
@@ -381,29 +383,261 @@ public class StorageManager {
         return file_to_fileid.get(index_file_name) != null;
     }
 
-    // the order of returned columns should be same as the order in schema
-    // i.e., first all fixed length columns, then all variable length columns
+    public int return_file_id(String table_name){
+        return  file_to_fileid.get(table_name);
+    }
+    // number of records, offset  - LE    //
+    public Object[] get_col(byte[] record_s, String table_name, int block_id, int rec_offs){
+        int file_id = file_to_fileid.get(table_name);
+        byte[] schema = db.get_data(file_id,0);
+        int num_var_cols = 0;
+        int num_col = (schema[1]<<8) | (schema[0] & 0xFF);
+
+        for(int i = 0; i < num_col;i++){
+            byte[] col_off = db.get_data(file_id,0,2+2*i,2);
+            int off = (col_off[1]<<8) | (col_off[0] & 0xFF);
+            byte[] col = db.get_data(file_id,0,off,2);
+            if (ColumnType.values()[col[0]] == ColumnType.VARCHAR){
+                num_var_cols++;
+            }
+        }
+        int off_fixed = 4*num_var_cols;
+
+        int num_fixed_cols = num_col - num_var_cols;
+        Object[] req = new Object[num_col];
+        for(int i = 0;i  < num_fixed_cols;i++){
+            byte[] offset = db.get_data(file_id,0,2+2*i,2);
+            int off = offset[1]<<8 | (offset[0] & 0xFF);
+            byte[] colinfo = db.get_data(file_id,0,off,1);
+            int datatypeByte = colinfo[0];
+            if (ColumnType.values()[datatypeByte] == ColumnType.INTEGER){
+                byte[] fx_col = Arrays.copyOfRange(record_s, off_fixed, off_fixed + 4);
+                int temp = (fx_col[3]<<24) | (fx_col[2]<<16) | (fx_col[1]<<8) | (fx_col[0] & 0xFF);
+                req[i] = temp;
+                off_fixed += 4;
+            }
+            if (ColumnType.values()[datatypeByte] == ColumnType.FLOAT){
+                byte[] fx_col = Arrays.copyOfRange(record_s, off_fixed, off_fixed + 4);
+                req[i] = ByteBuffer.wrap(fx_col).getFloat();
+                off_fixed += 4;
+            }
+            if (ColumnType.values()[datatypeByte] == ColumnType.DOUBLE){
+                byte[] fx_col = Arrays.copyOfRange(record_s, off_fixed, off_fixed + 8);
+                req[i] = ByteBuffer.wrap(fx_col).getDouble();
+                off_fixed += 8;
+            }
+        }
+        int offset=rec_offs;
+        for(int i = 0; i < num_var_cols;i++){
+            byte[] offs = db.get_data(file_id,block_id,offset,2);
+            int offs_int = (offs[1]<<8) | (offs[0] & 0xFF);
+
+            offset+=2;
+            byte[] len = db.get_data(file_id,block_id,offset,2);
+            offset+=2;
+
+            int len_int = (len[1]<<8) | (len[0] & 0xFF);
+
+            byte[] col = Arrays.copyOfRange(record_s, offs_int, offs_int + len_int);
+            req[i+num_fixed_cols] = new String(col);
+        }
+        return req;
+    }
+    public static String array_to_string(byte[] byteArray) {
+        ByteBuffer buffer = ByteBuffer.wrap(byteArray);
+        buffer.order(ByteOrder.LITTLE_ENDIAN);
+
+        return new String(buffer.array());
+    }
+
     public List<Object[]> get_records_from_block(String table_name, int block_id){
         /* Write your code here */
-        // return null if file does not exist, or block_id is invalid
-        // return list of records otherwise
-        return null;
+        if (!check_file_exists(table_name)) {
+            return null;
+        }
+        List<Object[]> records = new ArrayList<>();
+        byte[] num_rec = db.get_data(file_to_fileid.get(table_name), block_id,0,2);
+        int num_recs = (num_rec[0]<<8)|(num_rec[1] & 0xFF);
+        int end = 4096;
+        for(int i = 0; i < num_recs;i++){
+            byte[] b = db.get_data(file_to_fileid.get(table_name),block_id,2+2*i,2);
+            int offset = (b[0] << 8)  | (b[1] & 0xFF);
+            byte[] rec = db.get_data(file_to_fileid.get(table_name),block_id,offset,end-offset);
+            records.add(get_col(rec, table_name, block_id,offset));
+            end = offset;
+        }
+        return records;
     }
 
     public boolean create_index(String table_name, String column_name, int order) {
-        /* Write your code here */
-        return false;
+        int file_id = file_to_fileid.get(table_name);
+        if (check_index_exists(table_name,column_name)){
+            System.out.println("Index already exists for column: " + column_name);
+            return false;
+        }
+        if (file_to_fileid.get(table_name) != null){
+            String index_file_name = table_name + "_" + column_name + "_index";
+
+            byte[] schema = get_data_block(table_name,0);
+            int num_col = (schema[1]<<8) | (schema[0] & 0xFF);
+            int index_1 = 0;
+            Pair<Integer, Integer> result = new Pair<>(-1, -1);
+            for(int i = 0; i < num_col;i++){
+                byte[] col_off = db.get_data(file_id,0,2+2*i,2);
+                int off = (col_off[1]<<8) | (col_off[0] & 0xFF);
+                byte[] col_dtype = db.get_data(file_id,0,off,2);
+                int len_col_name = col_dtype[1];
+                byte[] colname = db.get_data(file_id,0,off+2,len_col_name);
+                String req_col_name = array_to_string(colname);
+                if (req_col_name.compareTo(column_name) == 0){
+                    int columnTypeValue = col_dtype[0];
+                    result = new Pair<>(index_1, columnTypeValue);}
+                index_1++;
+            }
+            Integer idx = result.getKey();
+            ColumnType dataType = ColumnType.values()[result.getValue()];
+            int counter,num_records,i;
+            switch (dataType) {
+                case INTEGER:
+                    BPlusTreeIndexFile<Integer> bPlusTree = new BPlusTreeIndexFile<>(order, Integer.class);
+                    num_records = 0;
+                    i = 1;
+                    while (num_records < db.get_num_records(file_id)){
+                        List<Object[]> required = get_records_from_block(table_name, i);
+                        for(int j = 0; j < required.size(); j++){
+                            Object[] row = required.get(j);
+                            Integer key = (Integer) row[idx];
+                            bPlusTree.insert(key, i);
+                        }
+                        i++;
+                        num_records += required.size();
+                    }
+                    counter = db.addFile(bPlusTree);
+                    file_to_fileid.put(index_file_name, counter);
+
+                    break;
+
+                case FLOAT:
+                    BPlusTreeIndexFile<Float> bPlusTree2 = new BPlusTreeIndexFile<>(order, Float.class);
+                    counter = db.addFile(bPlusTree2);
+                    file_to_fileid.put(index_file_name, counter);
+                    num_records = 0;
+                    i = 1;
+                    while (num_records < db.get_num_records(file_id)){
+                        List<Object[]> required = get_records_from_block(table_name, i);
+                        for(int j = 0; j < required.size(); j++){
+                            Object[] row = required.get(j);
+                            Float key = (Float) row[idx];
+                            bPlusTree2.insert(key, i);
+                        }
+                        i++;
+                        num_records += required.size();
+                    }
+                    break;
+
+                case DOUBLE:
+                    BPlusTreeIndexFile<Double> bPlusTree3 = new BPlusTreeIndexFile<>(order, Double.class);
+                    counter = db.addFile(bPlusTree3);
+                    file_to_fileid.put(index_file_name, counter);
+                    num_records = 0;
+                    i = 1;
+                    while (num_records < db.get_num_records(file_id)){
+                        List<Object[]> required = get_records_from_block(table_name, i);
+                        for(int j = 0; j < required.size(); j++){
+                            Object[] row = required.get(j);
+                            Double key = (Double) row[idx];
+                            bPlusTree3.insert(key, i);
+                        }
+                        i++;
+                        num_records += required.size();
+                    }
+                    break;
+                case VARCHAR:
+                    BPlusTreeIndexFile<String> bPlusTree1 = new BPlusTreeIndexFile<>(order, String.class);
+                    counter = db.addFile(bPlusTree1);
+                    file_to_fileid.put(index_file_name, counter);
+                    num_records = 0;
+                    i = 1;
+                    while (num_records < db.get_num_records(file_id)){
+                        List<Object[]> required = get_records_from_block(table_name, i);
+                        for(int j = 0; j < required.size(); j++){
+                            Object[] row = required.get(j);
+                            String key = (String) row[idx];
+                            bPlusTree1.insert(key, i);
+                        }
+                        i++;
+                        num_records += required.size();
+                    }
+                    break;
+                case BOOLEAN:
+                    BPlusTreeIndexFile<Boolean> bPlusTree4 = new BPlusTreeIndexFile<>(order, Boolean.class);
+                    counter = db.addFile(bPlusTree4);
+                    file_to_fileid.put(index_file_name, counter);
+                    num_records = 0;
+                    i = 1;
+                    while (num_records < db.get_num_records(file_id)){
+                        List<Object[]> required = get_records_from_block(table_name, i);
+                        for(int j = 0; j < required.size(); j++){
+                            Object[] row = required.get(j);
+                            Boolean key = (Boolean) row[idx];
+                            bPlusTree4.insert(key, i);
+                        }
+                        i++;
+                        num_records += required.size();
+                    }
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported column type: " + dataType);
+            }
+
+            return true;
+        }
+        else{
+            System.out.println("Table not found: " + table_name);
+            return false;
+        }
     }
+
 
     // returns the block_id of the leaf node where the key is present
     public int search(String table_name, String column_name, RexLiteral value) {
-        /* Write your code here */
-        return -1;
+        if (!check_index_exists(table_name, column_name)) {
+            System.out.println("Index does not exist for column: " + column_name);
+            return -1;
+        }
+
+
+        // Retrieve index file
+        String index_file_name = table_name + "_" + column_name + "_index";
+        int index_file_id = file_to_fileid.get(index_file_name);
+//
+//        // Perform search in the B+ tree index
+        switch (value.getType().getSqlTypeName()) {
+            case INTEGER:
+                //  not sure about the type casting of value
+                return db.search_index(index_file_id,(Integer)value.getValue());
+
+            case FLOAT:
+                return db.search_index(index_file_id,(Float)value.getValue());
+            case DOUBLE:
+                return db.search_index(index_file_id,(Double)value.getValue());
+            case BOOLEAN:
+                return  db.search_index(index_file_id,(Boolean)value.getValue());
+            case VARCHAR:
+                return db.search_index(index_file_id,(String)value.getValue());
+            default:
+                throw new IllegalArgumentException("Unsupported data type: " + value.getType().getSqlTypeName());
+        }
+
     }
+
+
 
     public boolean delete(String table_name, String column_name, RexLiteral value) {
         /* Write your code here */
         // Hint: You need to delete from both - the file and the index
+
+
         return false;
     }
 
